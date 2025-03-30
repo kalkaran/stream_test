@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Live Audio Recorder with Registration</title>
+</head>
+<body>
+  <h1>Live Audio Recorder</h1>
+  <button id="start">Start Recording</button>
+  <button id="stop" disabled>Stop Recording</button>
+  <!-- Button for one-time status check -->
+  <button id="statusButton">Get Conversation Status</button>
+  <!-- Toggle button for continuous polling -->
+  <button id="togglePollingButton">Start Polling Status</button>
+  <!-- Div to display the conversation status -->
+  <pre id="statusOutput"></pre>
+  
+  <script>
+    let mediaRecorder;
+    let sessionId = null;
+    let chunkNumber = 0;
+    let recordingActive = false; // flag to control continuous recording
+    let stream; // Will store the MediaStream object.
+    const chunkDuration = 30000; // 5 seconds per chunk
+    const backendUrl = 'http://127.0.0.1:8888/upload_audio';
+    const registerUrl = 'http://127.0.0.1:8888/register_conversation';
+    const statusUrl = 'http://127.0.0.1:8888/conversation_status_all';
+
+    async function registerConversation() {
+      try {
+        const response = await fetch(registerUrl, { method: 'POST' });
+        if (!response.ok) throw new Error("Registration failed");
+        const data = await response.json();
+        console.log("Registration successful:", data);
+        return data;
+      } catch (error) {
+        console.error("Error during registration:", error);
+        throw error;
+      }
+    }
+
+    async function fetchWithTimeout(resource, options = {}) {
+      const { timeout = 5000 } = options;
+      const controller = new AbortController();
+      const id = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(resource, { ...options, signal: controller.signal });
+        return response;
+      } finally {
+        clearTimeout(id);
+      }
+    }
+
+    async function sendAudioChunk(blob, sessionId, chunkNumber, chunkType, retryCount = 3) {
+      const formData = new FormData();
+      formData.append('audio', blob, `chunk${chunkNumber}.webm`);
+      formData.append('session_id', sessionId);
+      formData.append('chunk_number', chunkNumber);
+      formData.append('chunk_type', chunkType);
+      try {
+        const response = await fetchWithTimeout(backendUrl, {
+          method: 'POST',
+          body: formData,
+          timeout: 5000
+        });
+        if (!response.ok) throw new Error('Server response wasn’t OK');
+        const data = await response.json();
+        console.log(`Chunk ${chunkNumber} sent successfully:`, data);
+      } catch (error) {
+        console.warn(`Error sending chunk ${chunkNumber}:`, error);
+        if (retryCount > 0) {
+          console.warn(`Retrying chunk ${chunkNumber} in 5 seconds...`);
+          setTimeout(() => {
+            sendAudioChunk(blob, sessionId, chunkNumber, chunkType, retryCount - 1);
+          }, 5000);
+        } else {
+          console.error(`Failed to send chunk ${chunkNumber} after retries.`);
+        }
+      }
+    }
+
+    // This function handles one recording cycle: it creates a new MediaRecorder,
+    // records for chunkDuration, then stops. On stop, it sends the data and (if still active)
+    // restarts the recording.
+    function startChunkRecording(options) {
+      mediaRecorder = new MediaRecorder(stream, options);
+
+      mediaRecorder.addEventListener('dataavailable', (event) => {
+        if (event.data && event.data.size > 0) {
+          console.log(`Chunk ${chunkNumber}: size ${event.data.size} bytes, type ${event.data.type}`);
+          const blob = event.data;
+          let chunkType = (chunkNumber === 0) ? "first" : "middle";
+          console.log(`Sending chunk ${chunkNumber} as ${chunkType}`);
+          sendAudioChunk(blob, sessionId, chunkNumber, chunkType);
+          chunkNumber++;
+        }
+      });
+
+      mediaRecorder.addEventListener('stop', () => {
+        if (recordingActive) {
+          console.log("Restarting recorder for next chunk...");
+          // Restart recording immediately for the next chunk.
+          startChunkRecording(options);
+          // Stop recording after chunkDuration.
+          setTimeout(() => {
+            if (mediaRecorder.state !== "inactive") {
+              mediaRecorder.stop();
+            }
+          }, chunkDuration);
+        }
+      });
+
+      mediaRecorder.start();
+      setTimeout(() => {
+        if (mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+        }
+      }, chunkDuration);
+    }
+
+    document.getElementById('start').addEventListener('click', async () => {
+      try {
+        const registrationData = await registerConversation();
+        sessionId = registrationData.session_id;
+      } catch (error) {
+        console.error("Cannot start recording because registration failed.");
+        return;
+      }
+      
+      chunkNumber = 0;
+      recordingActive = true;
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const options = { mimeType: 'audio/webm;codecs=opus' };
+      startChunkRecording(options);
+      document.getElementById('stop').disabled = false;
+    });
+    
+    document.getElementById('stop').addEventListener('click', () => {
+      recordingActive = false;
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+      document.getElementById('stop').disabled = true;
+    });
+
+    document.getElementById('statusButton').addEventListener('click', async () => {
+      try {
+        const response = await fetch(statusUrl, { method: 'POST' });
+        if (!response.ok) throw new Error('Error fetching conversation status');
+        const data = await response.json();
+        console.log("Conversation status:", data);
+        document.getElementById('statusOutput').innerText = JSON.stringify(data, null, 2);
+      } catch (error) {
+        console.error("Error fetching conversation status:", error);
+        document.getElementById('statusOutput').innerText = "Error fetching conversation status.";
+      }
+    });
+
+    let polling = false;
+    let pollIntervalId = null;
+    document.getElementById('togglePollingButton').addEventListener('click', () => {
+      if (!polling) {
+        polling = true;
+        document.getElementById('togglePollingButton').innerText = "Stop Polling Status";
+        pollIntervalId = setInterval(async () => {
+          try {
+            const response = await fetch(statusUrl, { method: 'POST' });
+            if (!response.ok) throw new Error('Error fetching conversation status');
+            const data = await response.json();
+            console.log("Polling conversation status:", data);
+            document.getElementById('statusOutput').innerText = JSON.stringify(data, null, 2);
+          } catch (error) {
+            console.error("Error polling conversation status:", error);
+            document.getElementById('statusOutput').innerText = "Error fetching conversation status.";
+          }
+        }, 2000);
+      } else {
+        polling = false;
+        document.getElementById('togglePollingButton').innerText = "Start Polling Status";
+        if (pollIntervalId) {
+          clearInterval(pollIntervalId);
+          pollIntervalId = null;
+        }
+      }
+    });
+  </script>
+</body>
+</html>
