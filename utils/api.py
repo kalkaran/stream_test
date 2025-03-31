@@ -12,13 +12,16 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 # Configuration constants
-
 USER_ID = os.getenv("USER_ID")
-API_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{USER_ID)}/ai/run/"
+API_BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{USER_ID}/ai/run/"
 API_TOKEN = os.getenv("API_TOKEN")
 if not API_TOKEN:
     logging.error("API_TOKEN not found in environment variables!")
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+
+
+
+
 
 def llama(prompt, max_retries=3, retry_delay=2):
     """
@@ -32,9 +35,10 @@ def llama(prompt, max_retries=3, retry_delay=2):
     Returns:
         dict or None: The JSON response from the Llama API or None if all attempts fail.
     """
+    categories = ["music", "science"]
     payload = {
         "messages": [
-            {"role": "system", "content": "You are a friendly assistant that helps write stories"},
+            {"role": "system", "content": f"You are a friendly assistant that helps categorise conversations and summarises if there is any of these categories in the text: {str(categories)}"},
             {"role": "user", "content": prompt}
         ]
     }
@@ -47,7 +51,7 @@ def llama(prompt, max_retries=3, retry_delay=2):
             response.raise_for_status()
             result = response.json()
             logging.info("Llama response: %s", result)
-            return result
+            return result.get("result").get("response")
         except Exception as e:
             logging.error("Error in llama API call on attempt %d: %s", attempt+1, e)
             if attempt < max_retries - 1:

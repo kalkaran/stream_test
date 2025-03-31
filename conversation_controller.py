@@ -4,7 +4,7 @@ import threading
 import time
 import logging
 from utils.convert_all_formats_to_wav import AudioConverter
-from utils.api import whisper
+from utils.api import whisper, llama
 
 logging.basicConfig(level=logging.INFO)
 
@@ -22,8 +22,9 @@ class Conversation:
     """
     def __init__(self, conversation_id: str):
         self.conversation_id = conversation_id
-        self.chunks = {}  # {chunk_number: {"file_path": ..., "file_name": ..., "chunk_type": ..., "chunk_converted"}}
+        self.chunks = {}  
         self.final_chunk_received = False
+        self.category_results = []  # Each element: {"prompt": ..., "result": ...}
 
     def add_chunk(self, chunk_number: int, chunk_file_path: str, chunk_name: str, chunk_type: str):
         self.chunks[chunk_number] = {
@@ -118,8 +119,66 @@ class Conversation:
                     chunk["whisper_converted"] = "Failed"
                     return f"Whisper conversion failed for chunk {chunk_number}"
         return "No pending Whisper conversion"
+
     
-    
+    def categorize(self, max_segment_words=20, overlap=10):
+        """
+        Collects words from all whisper outputs, creates overlapping segments, 
+        calls the llama API on each segment, and stores the prompt and result.
+        
+        - The first segment is the first max_segment_words.
+        - Subsequent segments are created with an overlap (last 'overlap' words from previous segment plus next words).
+        
+        Returns:
+            list: List of dictionaries with keys 'prompt' and 'result'.
+            Returns None if insufficient words are available.
+        """
+        # Concatenate whisper outputs in order.
+        all_text = ""
+        for chunk_number in sorted(self.chunks.keys()):
+            chunk = self.chunks[chunk_number]
+            if chunk.get("whisper_converted") is True and chunk.get("whisper_output"):
+                all_text += " " + chunk["whisper_output"]
+        all_text = all_text.strip()
+        if not all_text:
+            logging.info("No whisper output available for categorization.")
+            return None
+        words = all_text.split()
+        if len(words) < max_segment_words:
+            logging.info("Not enough words to categorize. Need at least %d, got %d", max_segment_words, len(words))
+            return None
+
+        segments = []
+        # First segment: first max_segment_words.
+        segments.append({"prompt": " ".join(words[:max_segment_words]), "result": None})
+        last_index = max_segment_words
+
+        # Create sliding windows.
+        while last_index < len(words):
+            start_index = max(last_index - overlap, 0)
+            end_index = start_index + max_segment_words
+            if end_index > len(words):
+                break
+            segments.append({"prompt": " ".join(words[start_index:end_index]), "result": None})
+            last_index = end_index
+
+        results = []
+        for seg in segments:
+            try:
+                logging.info("Sending categorization prompt: %s", seg["prompt"])
+                response = llama(seg["prompt"])
+                seg["result"] = response
+                results.append(seg)
+            except Exception as e:
+                logging.error("Error categorizing prompt '%s': %s", seg["prompt"], e)
+                seg["result"] = "Error"
+                results.append(seg)
+        self.category_results = results
+        return results
+
+    def get_category_details(self):
+            """Returns the list of categorization details (prompt and result) if available."""
+            return self.category_results if self.category_results else None
 
 
 class ConversationController:
@@ -133,6 +192,8 @@ class ConversationController:
         logging.info("Started Conversion Controller.")
         self.conversations = {}  # {session_id: Conversation}
         self._conversion_thread = None
+        self._whisper_thread = None
+        self._category_thread = None
         self._stop_event = threading.Event()
     
     ## AUDIO CONVERTER:
@@ -235,6 +296,51 @@ class ConversationController:
             time.sleep(check_interval)
 
 
+        # Category conversion methods:
+    def convert_chunks_to_category(self, parallel_limit=5):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_limit) as executor:
+            futures = []
+            for conversation in self.conversations.values():
+                # Only attempt categorization if there is new whisper output.
+                futures.append(executor.submit(conversation.categorize))
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        logging.info("Category conversion task result: %s", result)
+                except Exception as e:
+                    logging.error("Category conversion task raised an exception: %s", e)
+
+    def _background_category_loop(self, check_interval, parallel_limit):
+        while not self._stop_event.is_set():
+            self.convert_chunks_to_category(parallel_limit=parallel_limit)
+            time.sleep(check_interval)
+
+    def start_background_category_conversion(self, check_interval=10, parallel_limit=5):
+        if self._category_thread is None or not self._category_thread.is_alive():
+            self._stop_event.clear()
+            self._category_thread = threading.Thread(
+                target=self._background_category_loop,
+                args=(check_interval, parallel_limit),
+                daemon=True
+            )
+            self._category_thread.start()
+            logging.info("Started background category conversion thread.")
+
+    def stop_background_conversions(self):
+        self._stop_event.set()
+        if self._conversion_thread is not None:
+            self._conversion_thread.join()
+            logging.info("Stopped background WAV conversion thread.")
+        if self._whisper_thread is not None:
+            self._whisper_thread.join()
+            logging.info("Stopped background Whisper conversion thread.")
+        if self._category_thread is not None:
+            self._category_thread.join()
+            logging.info("Stopped background category conversion thread.")
+
+
+
     def handle_chunk(self, *, session_id: str, chunk_number: int, chunk_file_path: str, chunk_name: str, chunk_type: str) -> Conversation:
         """
         Handles an incoming chunk: if a conversation with the given session_id exists, it adds the chunk to it;
@@ -309,6 +415,27 @@ class ConversationController:
             logging.error("Error retrieving whisper outputs: %s", e)
         return whisper_dict
 
+    # def get_all_conversation_summary(self):
+    #     try:
+    #         summary = []
+    #         for conv_id, conversation in self.conversations.items():
+    #             converted_count = sum(1 for chunk in conversation.chunks.values() if chunk["chunk_converted"] is True)
+    #             whisper_count = sum(1 for chunk in conversation.chunks.values() if chunk.get("whisper_converted") is True)
+    #             summary.append({
+    #                 "conversation_id": conv_id,
+    #                 "file_count": len(conversation.chunks),
+    #                 "converted_count": converted_count,
+    #                 "whisper_count": whisper_count
+    #             })
+    #             summary.append(self.get_whisper_outputs().get(conv_id))
+    #             #summary.append(self.)    
+    #         return summary
+    #     except Exception as e:
+    #         logging.error(f"Error in get_all_conversation_summary: {e}")
+    #         return []
+
+
+
     def get_all_conversation_summary(self):
         try:
             summary = []
@@ -319,13 +446,16 @@ class ConversationController:
                     "conversation_id": conv_id,
                     "file_count": len(conversation.chunks),
                     "converted_count": converted_count,
-                    "whisper_count": whisper_count
+                    "whisper_count": whisper_count,
+                    "whisper_outputs": self.get_whisper_outputs().get(conv_id),
+                    "category_details": conversation.get_category_details()
                 })
-                summary.append(self.get_whisper_outputs().get(conv_id))    
             return summary
         except Exception as e:
             logging.error(f"Error in get_all_conversation_summary: {e}")
             return []
+
+
 
 # Example usage:
 if __name__ == "__main__":

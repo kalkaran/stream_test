@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
     logging.info("Application startup: Starting background conversion.")
     controller.start_background_conversion(check_interval=5, parallel_limit=10)
     controller.start_background_whisper_conversion(check_interval=5, parallel_limit=10)
+    controller.start_background_category_conversion(parallel_limit=5)
     logging.info("Background conversion thread started.")
     yield
     logging.info("Application shutdown: Stopping background conversion.")
